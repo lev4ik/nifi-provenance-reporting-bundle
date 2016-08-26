@@ -41,6 +41,8 @@ import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.reporting.ReportingContext;
 
+import javax.json.JsonObject;
+
 @Tags({"http", "provenance"})
 @CapabilityDescription("A provenance reporting task that posts to an HTTP server")
 public class HttpProvenanceReporter extends AbstractProvenanceReporter {
@@ -82,9 +84,14 @@ public class HttpProvenanceReporter extends AbstractProvenanceReporter {
         getLogger().info("{} {} {}", new Object[]{Integer.valueOf(response.code()), response.message(), response.body().string()});
     }
 
-    public void indexEvent(final Map<String, Object> event, final ReportingContext context) throws IOException {
+    public void indexEvent(final JsonObject event, final ReportingContext context) throws IOException {
         final String url = context.getProperty(URL).getValue();
-        final String json = new ObjectMapper().writeValueAsString(event);
-        post(json, url);
+        post(event.toString(), url);
+    }
+
+    public void indexEvents(final ArrayList<JsonObject> events, final ReportingContext context) throws IOException {
+        for (JsonObject event: events){
+            indexEvent(event, context);
+        }
     }
 }

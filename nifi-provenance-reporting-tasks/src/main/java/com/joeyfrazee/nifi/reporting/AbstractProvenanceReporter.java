@@ -19,29 +19,23 @@ package com.joeyfrazee.nifi.reporting;
 import java.io.*;
 import java.text.SimpleDateFormat;
 import java.util.*;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.concurrent.atomic.AtomicLong;
+
+import javax.json.Json;
+import javax.json.JsonBuilderFactory;
+import javax.json.JsonObject;
+import javax.json.JsonObjectBuilder;
 
 import org.apache.nifi.components.PropertyDescriptor;
-import org.apache.nifi.components.PropertyValue;
 import org.apache.nifi.components.state.Scope;
-import org.apache.nifi.components.state.StateManager;
-import org.apache.nifi.components.state.StateMap;
 import org.apache.nifi.annotation.behavior.Stateful;
-import org.apache.nifi.flowfile.FlowFile;
-import org.apache.nifi.processor.*;
-import org.apache.nifi.processor.exception.ProcessException;
+import org.apache.nifi.controller.status.PortStatus;
+import org.apache.nifi.controller.status.ProcessGroupStatus;
+import org.apache.nifi.controller.status.ProcessorStatus;
+import org.apache.nifi.controller.status.RemoteProcessGroupStatus;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.reporting.AbstractReportingTask;
 import org.apache.nifi.reporting.ReportingContext;
-import org.apache.nifi.reporting.EventAccess;
-import org.apache.nifi.provenance.ProvenanceEventRepository;
 import org.apache.nifi.provenance.ProvenanceEventRecord;
-import org.apache.nifi.provenance.ProvenanceEventType;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 @Stateful(scopes = Scope.CLUSTER, description = "After querying the "
         + "provenance repository, the last seen event id is stored so "
@@ -49,6 +43,20 @@ import org.slf4j.LoggerFactory;
         + "NiFi. To clear the maximum values, clear the state of the processor "
         + "per the State Management documentation.")
 public abstract class AbstractProvenanceReporter extends AbstractReportingTask {
+
+    private static final String LAST_EVENT_ID_KEY = "lastEventId";
+    private static final String TIMESTAMP_FORMAT = "YYYY-MM-dd'T'HH:mm:ss.SSS'Z'";
+
+    public static final PropertyDescriptor REPORT_IN_BATCH_MODE = new PropertyDescriptor
+            .Builder().name("Report in Batch Mode")
+            .displayName("Report in Batch Mode")
+            .description("Makes the underlying reporting to be in batches instead of per event")
+            .required(true)
+            .defaultValue("false")
+            .allowableValues("true", "false")
+            .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
+            .build();
+
     public static final PropertyDescriptor PAGE_SIZE = new PropertyDescriptor
             .Builder().name("Page Size")
             .displayName("Page Size")
@@ -58,212 +66,157 @@ public abstract class AbstractProvenanceReporter extends AbstractReportingTask {
             .addValidator(StandardValidators.POSITIVE_INTEGER_VALIDATOR)
             .build();
 
-    public static final PropertyDescriptor MAX_HISTORY = new PropertyDescriptor
-            .Builder().name("Maximum History")
-            .displayName("Maximum History")
-            .description(
-                "How far back to look into the provenance repository to " +
-                "index provenance events"
-            )
-            .required(true)
-            .defaultValue("10000")
-            .addValidator(StandardValidators.NON_NEGATIVE_INTEGER_VALIDATOR)
-            .build();
+    private volatile long firstEventId = -1L;
 
     protected List<PropertyDescriptor> descriptors;
 
-    private long getLastEventId(StateManager stateManager) {
-        try {
-            final StateMap stateMap = stateManager.getState(Scope.CLUSTER);
-            final String lastEventIdStr = stateMap.get("lastEventId");
-            final long lastEventId = lastEventIdStr != null ? Long.parseLong(lastEventIdStr) : 0;
-            return lastEventId;
-        } catch (final IOException ioe) {
-            getLogger().warn("Failed to retrieve the last event id from the "
-                    + "state manager.", ioe);
-            return 0;
-        }
-    }
+    private Map<String,String> createComponentMap(final ProcessGroupStatus status) {
+        final Map<String,String> componentMap = new HashMap<>();
 
-    private void setLastEventId(StateManager stateManager, long eventId) throws IOException {
-        final StateMap stateMap = stateManager.getState(Scope.CLUSTER);
-        final Map<String, String> statePropertyMap = new HashMap<>(stateMap.toMap());
-        statePropertyMap.put("lastEventId", Long.toString(eventId));
-        stateManager.setState(statePropertyMap, Scope.CLUSTER);
-    }
+        if (status != null) {
+            componentMap.put(status.getId(), status.getName());
 
-    private Map<String, Object> setField(Map<String, Object> map, final String key, final Object value, final boolean overwrite) {
-        Pattern p = Pattern.compile("^(\\w+)\\.(.*)$");
-        Matcher m = p.matcher(key);
-        if (m.find()) {
-            String head = m.group(1);
-            String tail = m.group(2);
-            Map<String, Object> obj = (Map<String, Object>) map.get(head);
-            if (obj == null) {
-                obj = new HashMap<String, Object>();
+            for (final ProcessorStatus procStatus : status.getProcessorStatus()) {
+                componentMap.put(procStatus.getId(), procStatus.getName());
             }
-            Object v = setField(obj, tail, value, overwrite);
-            map.put(head, v);
-        }
-        else {
-            Object obj = map.get(key);
-            if (obj != null && (obj instanceof Map)) {
-                getLogger().warn("value at " + key + " is a Map");
-                if (overwrite) {
-                    map.put(key, value);
-                }
+
+            for (final PortStatus portStatus : status.getInputPortStatus()) {
+                componentMap.put(portStatus.getId(), portStatus.getName());
             }
-            else {
-                map.put(key, value);
+
+            for (final PortStatus portStatus : status.getOutputPortStatus()) {
+                componentMap.put(portStatus.getId(), portStatus.getName());
             }
-        }
-        return map;
-    }
 
-    private Map<String, Object> setField(Map<String, Object> map, final String key, final Object value) {
-        return setField(map, key, value, false);
-    }
+            for (final RemoteProcessGroupStatus rpgStatus : status.getRemoteProcessGroupStatus()) {
+                componentMap.put(rpgStatus.getId(), rpgStatus.getName());
+            }
 
-    private Map<String, Object> createEventMap(ProvenanceEventRecord e) {
-        final Map<String, Object> source = new HashMap<String, Object>();
-        final SimpleDateFormat ft = new SimpleDateFormat ("YYYY-MM-dd'T'HH:mm:ss.SSS'Z'");
-
-        source.put("@timestamp", ft.format(new Date()));
-        source.put("event_id", Long.valueOf(e.getEventId()));
-        source.put("event_time", new Date(e.getEventTime()));
-        source.put("entry_date", new Date(e.getFlowFileEntryDate()));
-        source.put("lineage_start_date", new Date(e.getLineageStartDate()));
-        source.put("file_size", Long.valueOf(e.getFileSize()));
-
-        final Long previousFileSize = e.getPreviousFileSize();
-        if (previousFileSize != null && previousFileSize >= 0) {
-            source.put("previous_file_size", previousFileSize);
-        }
-
-        final long eventDuration = e.getEventDuration();
-        if (eventDuration >= 0) {
-            source.put("event_duration_millis", eventDuration);
-            source.put("event_duration_seconds", eventDuration / 1000);
-        }
-
-        final ProvenanceEventType eventType = e.getEventType();
-        if (eventType != null) {
-            source.put("event_type", eventType.toString());
-        }
-
-        final String componentId = e.getComponentId();
-        if (componentId != null) {
-            source.put("component_id", componentId);
-        }
-
-        final String componentType = e.getComponentType();
-        if (componentType != null) {
-            source.put("component_type", componentType);
-        }
-
-        final String sourceSystemId = e.getSourceSystemFlowFileIdentifier();
-        if (sourceSystemId != null) {
-            source.put("source_system_id", sourceSystemId);
-        }
-
-        final String flowFileId = e.getFlowFileUuid();
-        if (flowFileId != null) {
-            source.put("flow_file_id", flowFileId);
-        }
-
-        final List<String> parentIds = e.getParentUuids();
-        if (parentIds != null && !parentIds.isEmpty()) {
-            source.put("parent_ids", parentIds);
-        }
-
-        final List<String> childIds = e.getChildUuids();
-        if (childIds != null && !childIds.isEmpty()) {
-            source.put("child_ids", childIds);
-        }
-
-        final String details = e.getDetails();
-        if (details != null) {
-            source.put("details", details);
-        }
-
-        final String relationship = e.getRelationship();
-        if (relationship != null) {
-            source.put("relationship", relationship);
-        }
-
-        final String sourceQueueId = e.getSourceQueueIdentifier();
-        if (sourceQueueId != null) {
-            source.put("source_queue_id", sourceQueueId);
-        }
-
-        final Map<String, Object> attributes = new HashMap<String, Object>();
-
-        final Map<String, String> receivedAttributes = e.getAttributes();
-        if (receivedAttributes != null && !receivedAttributes.isEmpty()) {
-            for (Map.Entry<String, String> a : receivedAttributes.entrySet()) {
-                setField(attributes, a.getKey(), a.getValue());
+            for (final ProcessGroupStatus childGroup : status.getProcessGroupStatus()) {
+                componentMap.put(childGroup.getId(), childGroup.getName());
             }
         }
 
-        final Map<String, String> updatedAttributes = e.getUpdatedAttributes();
-        if (updatedAttributes != null && !updatedAttributes.isEmpty()) {
-            for (Map.Entry<String, String> a : updatedAttributes.entrySet()) {
-                setField(attributes, a.getKey(), a.getValue());
-            }
-        }
-
-        source.put("attributes", attributes);
-
-        return source;
+        return componentMap;
     }
 
     @Override
     public List<PropertyDescriptor> getSupportedPropertyDescriptors() {
         final List<PropertyDescriptor> descriptors = new ArrayList<PropertyDescriptor>();
         descriptors.add(PAGE_SIZE);
-        descriptors.add(MAX_HISTORY);
+        descriptors.add(REPORT_IN_BATCH_MODE);
         return descriptors;
     }
 
-    public abstract void indexEvent(final Map<String, Object> event, final ReportingContext context) throws IOException;
+    public abstract void indexEvent(final JsonObject event, final ReportingContext context) throws IOException;
+
+    public abstract void indexEvents(final ArrayList<JsonObject> events, final ReportingContext context) throws IOException;
+
+    private void processEvents(ReportingContext context, JsonBuilderFactory factory, JsonObjectBuilder builder, Map<String, String> componentMap, List<ProvenanceEventRecord> events) throws  IOException{
+        final SimpleDateFormat df = new SimpleDateFormat (TIMESTAMP_FORMAT);
+
+        if (context.getProperty(REPORT_IN_BATCH_MODE).asBoolean()){
+            ArrayList<JsonObject> jsonEvents = new ArrayList<>();
+            for (ProvenanceEventRecord e : events) {
+                final String componentName = componentMap.get(e.getComponentId());
+                jsonEvents.add(EventSerializer.serialize(factory, builder, e, df, componentName));
+            }
+            indexEvents(jsonEvents, context);
+        }
+        else {
+            for (ProvenanceEventRecord e : events) {
+                final String componentName = componentMap.get(e.getComponentId());
+                JsonObject event = EventSerializer.serialize(factory, builder, e, df, componentName);
+                indexEvent(event, context);
+            }
+        }
+    }
+
+    private boolean setFirstEventIdForCurrentRun(ReportingContext context, Long currMaxId) {
+        if (firstEventId < 0) {
+            try{
+                String value = StateManagementUtilities.getStateEntry(LAST_EVENT_ID_KEY, context.getStateManager());
+                if (value != null) {
+                    firstEventId = Long.parseLong(value);
+                }
+                else {
+                    firstEventId = currMaxId;
+                    try {
+                        StateManagementUtilities.setStateEntry(LAST_EVENT_ID_KEY, context.getStateManager(), String.valueOf(firstEventId));
+                    } catch (final IOException ioe) {
+                        getLogger().error("Failed to retrieve State Manager, while saving, from context due to: " + ioe.getMessage(), ioe);
+                        return false;
+                    }
+                }
+            } catch (final IOException ioe) {
+                getLogger().error("Failed to retrieve State Manager, while getting, from context due to: " + ioe.getMessage(), ioe);
+                return false;
+            }
+
+            if(currMaxId < firstEventId){
+                getLogger().warn("Current provenance max id is {} which is less than what was stored in state as the last queried event, which was {}. This means the provenance restarted its "+
+                        "ids. Restarting querying from the beginning.", new Object[]{currMaxId, firstEventId});
+                firstEventId = -1;
+            }
+        }
+        return true;
+    }
 
     @Override
     public void onTrigger(final ReportingContext context) {
-        final StateManager stateManager = context.getStateManager();
-        final EventAccess access = context.getEventAccess();
-        final ProvenanceEventRepository provenance = access.getProvenanceRepository();
-        final Long maxEventId = provenance.getMaxEventId();
+        final Map<String, ?> config = Collections.emptyMap();
+        final JsonBuilderFactory factory = Json.createBuilderFactory(config);
+        final JsonObjectBuilder builder = factory.createObjectBuilder();
+        final ProcessGroupStatus procGroupStatus = context.getEventAccess().getControllerStatus();
+        final Map<String,String> componentMap = createComponentMap(procGroupStatus);
 
-        final int pageSize = Integer.parseInt(context.getProperty(PAGE_SIZE).getValue());
-        final int maxHistory = Integer.parseInt(context.getProperty(MAX_HISTORY).getValue());
+        Long currMaxId = context.getEventAccess().getProvenanceRepository().getMaxEventId();
 
+        if(currMaxId == null) {
+            getLogger().debug("No events to send because no events have been created yet.");
+            return;
+        }
+
+        if (!setFirstEventIdForCurrentRun(context, currMaxId)) return;
+
+        if (currMaxId == firstEventId) {
+            getLogger().debug("No events to send due to the current max id being equal to the last id that was queried.");
+            return;
+        }
+
+        List<ProvenanceEventRecord> events;
         try {
-            long lastEventId = getLastEventId(stateManager);
+            events = context.getEventAccess().getProvenanceEvents(firstEventId, context.getProperty(PAGE_SIZE).asInteger());
+        } catch (final IOException ioe) {
+            getLogger().error("Failed to retrieve Provenance Events from repository due to: " + ioe.getMessage(), ioe);
+            return;
+        }
 
-            getLogger().info("starting event id: " + Long.toString(lastEventId));
-
-            while (maxEventId != null && lastEventId < maxEventId.longValue()) {
-                if (maxHistory > 0 && (maxEventId.longValue() - lastEventId) > maxHistory) {
-                    lastEventId = maxEventId.longValue() - maxHistory + 1;
-                }
-
-                final List<ProvenanceEventRecord> events = provenance.getEvents(lastEventId, pageSize);
-
-                for (ProvenanceEventRecord e : events) {
-                    final Map<String, Object> event = createEventMap(e);
-                    indexEvent(event, context);
-                }
-
-                lastEventId = Math.min(lastEventId + pageSize, maxEventId.longValue());
+        while(events != null && !events.isEmpty()) {
+            try {
+                processEvents(context, factory, builder, componentMap, events);
+            }
+            catch (IOException ioe){
+                getLogger().error("Failed to index Event, with batch mode set to {" + context.getProperty(REPORT_IN_BATCH_MODE).asBoolean() + "} due to: " + ioe.getMessage(), ioe);
+                return;
             }
 
-            getLogger().info("ending event id: " + Long.toString(lastEventId));
+            final ProvenanceEventRecord lastEvent = events.get(events.size() - 1);
 
-            setLastEventId(stateManager, lastEventId);
-        }
-        catch (IOException e) {
-            getLogger().error(e.getMessage(), e);
-            return;
+            try {
+                StateManagementUtilities.setStateEntry(LAST_EVENT_ID_KEY, context.getStateManager(), String.valueOf(lastEvent.getEventId()));
+                firstEventId = lastEvent.getEventId() + 1;
+            } catch (final IOException ioe) {
+                getLogger().error("Failed to retrieve State Manager, while saving, from context due to: " + ioe.getMessage(), ioe);
+                return;
+            }
+
+            try {
+                events = context.getEventAccess().getProvenanceEvents(firstEventId, context.getProperty(PAGE_SIZE).asInteger());
+            } catch (final IOException ioe) {
+                getLogger().error("Failed to retrieve Provenance Events from repository due to: " + ioe.getMessage(), ioe);
+                return;
+            }
         }
     }
 }
