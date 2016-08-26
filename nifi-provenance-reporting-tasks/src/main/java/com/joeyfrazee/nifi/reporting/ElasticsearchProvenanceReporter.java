@@ -20,6 +20,7 @@ import java.io.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
 
+import io.searchbox.action.BulkableAction;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.PropertyValue;
 import org.apache.nifi.flowfile.FlowFile;
@@ -32,6 +33,8 @@ import org.apache.nifi.reporting.ReportingContext;
 import io.searchbox.core.*;
 import io.searchbox.client.*;
 import io.searchbox.client.config.*;
+
+import javax.json.JsonObject;
 
 @Tags({"elasticsearch", "provenance"})
 @CapabilityDescription("A provenance reporting task that writes to Elasticsearch")
@@ -86,17 +89,37 @@ public class ElasticsearchProvenanceReporter extends AbstractProvenanceReporter 
         return descriptors;
     }
 
-    public void indexEvent(final Map<String, Object> event, final ReportingContext context) throws IOException {
+    public void indexEvent(final JsonObject event, final ReportingContext context) throws IOException {
         final String elasticsearchUrl = context.getProperty(ELASTICSEARCH_URL).getValue();
         final String elasticsearchIndex = context.getProperty(ELASTICSEARCH_INDEX).evaluateAttributeExpressions().getValue();
         final String elasticsearchType = context.getProperty(ELASTICSEARCH_DOC_TYPE).evaluateAttributeExpressions().getValue();
         final JestClient client = getJestClient(elasticsearchUrl);
-        final String id = Long.toString((Long) event.get("event_id"));
-        final Index index = new Index.Builder(event)
+        final String id = Long.toString(event.getInt("event_id"));
+        final Index index = new Index.Builder(event.toString())
             .index(elasticsearchIndex)
             .type(elasticsearchType)
             .id(id)
             .build();
         client.execute(index);
+    }
+
+    public void indexEvents(final ArrayList<JsonObject> events, final ReportingContext context) throws IOException {
+        final String elasticsearchUrl = context.getProperty(ELASTICSEARCH_URL).getValue();
+        final String elasticsearchIndex = context.getProperty(ELASTICSEARCH_INDEX).evaluateAttributeExpressions().getValue();
+        final String elasticsearchType = context.getProperty(ELASTICSEARCH_DOC_TYPE).evaluateAttributeExpressions().getValue();
+        final JestClient client = getJestClient(elasticsearchUrl);
+
+        List<BulkableAction> list = new ArrayList<>();
+        for (JsonObject event:events) {
+           list.add(new Index.Builder(event.toString()).build());
+        }
+
+        Bulk bulk = new Bulk.Builder()
+                .defaultIndex(elasticsearchIndex)
+                .defaultType(elasticsearchType)
+                .addAction(list)
+                .build();
+
+        client.execute(bulk);
     }
 }
